@@ -15,7 +15,10 @@
 #include <cstdio>
 #include <cstring>
 #include <deque>
+#include <limits>
+#include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "greedy_ctc_decoder.h"
@@ -317,6 +320,8 @@ class MockRnntEngine : public RnntEngine {
         int32_t* token_ids, const float* logit_bias = nullptr) override {
         check(joint_dim == cfg_.joint_dim, "rnnt mock: projected width");
         joint_calls++;
+        call_frames.push_back(T);
+        call_blank_bias.push_back(logit_bias != nullptr ? logit_bias[cfg_.blank_id] : 0.0f);
         if (logit_bias != nullptr) {
             last_logit_bias.assign(logit_bias, logit_bias + cfg_.vocab_size);
         } else {
@@ -343,6 +348,8 @@ class MockRnntEngine : public RnntEngine {
     int predictor_calls = 0;
     int joint_calls = 0;
     std::vector<float> last_logit_bias;
+    std::vector<int> call_frames;        // T of each joint call
+    std::vector<float> call_blank_bias;  // bias at blank of each joint call (0 = none)
 
    private:
     RnntConfig cfg_;
@@ -796,6 +803,143 @@ test_tdt_duration_crosses_step_boundary() {
     check(dec.last_emit_frame() == 2, "tdt: carries duration across step boundaries");
 }
 
+// Arbitrary; exact in binary and unlike any other constant in these tests.
+constexpr float kBlankPenalty = 2.25f;
+
+DecoderConfig
+penalty_config(int after_frames) {
+    DecoderConfig cfg;
+    cfg.blank_penalty = kBlankPenalty;
+    cfg.blank_penalty_after_frames = after_frames;
+    return cfg;
+}
+
+// MockRnntEngine ignores encoder values; only the frame count matters.
+std::vector<int>
+step_frames(RnntGreedyDecoder& dec, const MockRnntEngine& eng, int frames, int64_t frame_offset) {
+    const int joint_dim = eng.rnnt_config().joint_dim;
+    std::vector<float> enc(static_cast<size_t>(frames) * joint_dim, 0.0f);
+    return dec.step(enc.data(), joint_dim, frames, frame_offset);
+}
+
+void
+test_rnnt_blank_penalty_after_silence() {
+    const float p = kBlankPenalty;
+    {
+        // Off by default: no bias on any call.
+        MockRnntEngine eng;
+        RnntGreedyDecoder dec(&eng);
+        const int blank = eng.rnnt_config().blank_id;
+        eng.rounds = {{blank, blank, blank}};
+        step_frames(dec, eng, /*frames=*/3, /*frame_offset=*/0);
+        check(eng.last_logit_bias.empty(), "blank penalty: off by default");
+        check(eng.call_frames == std::vector<int>({3}), "blank penalty: off never splits a run");
+    }
+    {
+        // N = 2, one chunk of frames 0-4.
+        MockRnntEngine eng;
+        RnntGreedyDecoder dec(&eng, penalty_config(/*after_frames=*/2));
+        const int blank = eng.rnnt_config().blank_id;
+        // round 1, frames 0-4: nothing emitted yet, penalty on; emits 0 at frame 0
+        // round 2, frames 0-1: reset by that token, penalty off; all blank
+        // round 3, frames 2-4: 2 frames since the token, penalty on; emits 1 at frame 3
+        // round 4, frames 3-4: reset again (3 + 2 = 5 is past the chunk); all blank
+        eng.rounds = {{0}, {blank, blank}, {blank, 1}, {blank, blank}};
+        const auto ids = step_frames(dec, eng, /*frames=*/5, /*frame_offset=*/0);
+        check(ids == std::vector<int>({0, 1}), "blank penalty: emission sequence");
+        check(
+            eng.call_frames == std::vector<int>({5, 2, 3, 2}),
+            "blank penalty: the run splits at frame last + N");
+        check(
+            near(eng.call_blank_bias[0], -p) && near(eng.call_blank_bias[1], 0.0f) &&
+                near(eng.call_blank_bias[2], -p) && near(eng.call_blank_bias[3], 0.0f),
+            "blank penalty: on from the start and after N silent frames, off after any token");
+        check(dec.last_emit_frame() == 3, "blank penalty: the last token restarts the count");
+        // The count carries across chunks: frames 5-6 of the next chunk are past 3 + 2.
+        eng.rounds = {{blank, blank}};
+        step_frames(dec, eng, /*frames=*/2, /*frame_offset=*/5);
+        check(
+            near(eng.call_blank_bias.back(), -p), "blank penalty: the count carries across chunks");
+    }
+    {
+        // N = 0: a global penalty, every call biased.
+        MockRnntEngine eng;
+        RnntGreedyDecoder dec(&eng, penalty_config(/*after_frames=*/0));
+        const int blank = eng.rnnt_config().blank_id;
+        eng.rounds = {{0}, {blank, 1}, {blank}};
+        step_frames(dec, eng, /*frames=*/2, /*frame_offset=*/0);
+        bool all = !eng.call_blank_bias.empty();
+        for (float b : eng.call_blank_bias) all = all && near(b, -p);
+        check(all, "blank penalty: after_frames 0 applies it on every frame");
+    }
+    {
+        // Only blank is biased: token and punctuation logits stay native.
+        MockRnntEngine eng;
+        RnntGreedyDecoder dec(&eng, penalty_config(/*after_frames=*/0));
+        const int blank = eng.rnnt_config().blank_id;
+        eng.rounds = {{blank}};
+        step_frames(dec, eng, /*frames=*/1, /*frame_offset=*/0);
+        bool others_zero = eng.last_logit_bias.size() == static_cast<size_t>(blank) + 1;
+        for (int id = 0; others_zero && id < blank; ++id)
+            others_zero = near(eng.last_logit_bias[static_cast<size_t>(id)], 0.0f);
+        check(
+            others_zero && near(eng.last_logit_bias[static_cast<size_t>(blank)], -p),
+            "blank penalty: biases blank only");
+    }
+    {
+        // The max_symbols cap advances the clock: with N = 1 the frame after the
+        // capped one is one frame past the last token, so it is penalized.
+        MockRnntEngine eng;  // max_symbols_per_step = 3
+        RnntGreedyDecoder dec(&eng, penalty_config(/*after_frames=*/1));
+        const int blank = eng.rnnt_config().blank_id;
+        eng.rounds = {{0}, {1}, {2}, {blank}};
+        const auto ids = step_frames(dec, eng, /*frames=*/2, /*frame_offset=*/0);
+        check(ids == std::vector<int>({0, 1, 2}), "blank penalty: the symbol cap still applies");
+        check(
+            eng.call_frames.back() == 1 && near(eng.call_blank_bias.back(), -p),
+            "blank penalty: after the cap, the next frame is N = 1 past the last token");
+    }
+    {
+        // reset() starts a new stream: penalized again from its first frame.
+        // reset_utterance() (an end of utterance) keeps the count running.
+        MockRnntEngine eng;
+        RnntGreedyDecoder dec(&eng, penalty_config(/*after_frames=*/4));
+        const int blank = eng.rnnt_config().blank_id;
+        eng.rounds = {{0}, {blank}};
+        step_frames(dec, eng, /*frames=*/1, /*frame_offset=*/0);
+        check(near(eng.call_blank_bias.back(), 0.0f), "blank penalty: off right after a token");
+        dec.reset_utterance();
+        eng.rounds = {{blank}};
+        step_frames(dec, eng, /*frames=*/1, /*frame_offset=*/1);
+        check(
+            near(eng.call_blank_bias.back(), 0.0f),
+            "blank penalty: reset_utterance() keeps the count");
+        dec.reset();
+        eng.rounds = {{blank}};
+        step_frames(dec, eng, /*frames=*/1, /*frame_offset=*/2);
+        check(near(eng.call_blank_bias.back(), -p), "blank penalty: reset() turns it back on");
+    }
+    const std::vector<std::pair<double, int>> invalid = {
+        {-1.0, 0},
+        {1.0, -1},
+        {std::numeric_limits<double>::quiet_NaN(), 0},
+        {std::numeric_limits<double>::infinity(), 0}};
+    for (const auto& bad : invalid) {
+        DecoderConfig cfg;
+        cfg.blank_penalty = bad.first;
+        cfg.blank_penalty_after_frames = bad.second;
+        MockRnntEngine eng;
+        bool threw = false;
+        try {
+            RnntGreedyDecoder dec(&eng, cfg);
+        }
+        catch (const std::invalid_argument&) {
+            threw = true;
+        }
+        check(threw, "blank penalty: negative or non-finite values are refused");
+    }
+}
+
 }  // namespace
 
 int
@@ -816,6 +960,7 @@ main() {
     test_rnnt_stalls_do_not_inject_punctuation();
     test_rnnt_late_punctuation_returns_to_previous_final();
     test_rnnt_endpoint_punctuation_continuity();
+    test_rnnt_blank_penalty_after_silence();
     test_rnnt_state_threading_and_reset_utterance();
     test_rnnt_word_timings();
     test_rnnt_punctuation_word_timing();

@@ -233,6 +233,12 @@ class RnntGreedyDecoder : public Decoder {
     double bias_max_boost_ = 5.0;           // greedy-safe upper clamp on the request boost
     std::vector<float> bias_scratch_;       // dense per-round joint-logit bias
     std::vector<int32_t> boost_token_ids_;  // blank-excluded re-rank pass output
+
+    // DecoderConfig::blank_penalty: -penalty at blank, on frames at least
+    // blank_after_ frames past the last emitted token. Built once.
+    float blank_penalty_ = 0.0f;
+    int blank_after_ = 0;
+    std::vector<float> blank_bias_;
 };
 
 // Token-and-Duration Transducer greedy decoder. Predictor state commits only

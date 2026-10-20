@@ -48,6 +48,16 @@ struct DecoderConfig {
     // the boosted words insert spuriously / repeat. 5.0 keeps enough headroom
     // for harder words while staying well below riva's beam-oriented 10.
     double boosting_max_boost = 5.0;
+    // RNNT greedy only (TDT, CTC and flashlight ignore it): subtracted from the
+    // blank logit before the argmax on frames at least
+    // blank_penalty_after_frames frames past the last emitted token. Until the
+    // first token of the stream (or after reset()) it applies from the first
+    // frame. The count continues across reset_utterance(), as the clock does.
+    // A word whose first token narrowly loses to blank after a pause is then
+    // emitted; any emitted token restarts the count, so continuous speech is
+    // decoded as without it. 0 disables; after_frames 0 applies it on every frame.
+    double blank_penalty = 0.0;
+    int blank_penalty_after_frames = 0;
     void Register(common::ParameterParser& p) {
         p.Register(
             "kind",
@@ -94,6 +104,12 @@ struct DecoderConfig {
             "boosting_max_boost", &boosting_max_boost,
             "Upper clamp on the RNNT word-boosting alpha (greedy-safe default 5.0)",
             {"--boosting-max-boost"});
+        p.Register(
+            "blank_penalty", &blank_penalty,
+            "RNNT greedy: blank-logit penalty after a silent run (0 disables)");
+        p.Register(
+            "blank_penalty_after_frames", &blank_penalty_after_frames,
+            "RNNT greedy: encoder frames without an emitted token before blank_penalty applies");
     }
 };
 
