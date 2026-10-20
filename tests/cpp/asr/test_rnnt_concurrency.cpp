@@ -129,6 +129,107 @@ verify_decoder_batch(RnntModel& model) {
     return pm.max_observed_batch >= B && jm.max_observed_batch >= B;
 }
 
+// Per-stream logit bias through the batched joint (the blank penalty's path).
+// Each biased stream carries a DIFFERENT bias row that forces one token by a
+// margin no accumulation order can flip, so a row swapped between streams or
+// dropped shows as the wrong token. First biased streams alone, over several
+// rounds, so any batch of two or more mixes different rows; then together with
+// unbiased streams, which must match their B=1 result.
+bool
+verify_decoder_batch_bias(RnntModel& model) {
+    constexpr int kBiased = 4;
+    constexpr int kPlain = 2;
+    constexpr int B = kBiased + kPlain;
+    constexpr int T = 3;
+    const auto& rc = model.rnnt_config();
+    const int J = rc.joint_dim;
+    std::vector<std::vector<float>> enc(B, std::vector<float>(static_cast<size_t>(J) * T));
+    for (int b = 0; b < B; ++b)
+        for (size_t i = 0; i < enc[b].size(); ++i)
+            enc[b][i] = 0.35f * std::sin(0.017f * static_cast<float>(i + 29 * b));
+    std::vector<int32_t> forced(kBiased);
+    std::vector<std::vector<float>> bias(kBiased, std::vector<float>(rc.vocab_size, 0.0f));
+    for (int b = 0; b < kBiased; ++b) {
+        forced[b] = (7 + 11 * b) % rc.vocab_size;
+        if (forced[b] == rc.blank_id)
+            forced[b] = (forced[b] + 1) % rc.vocab_size;
+        bias[b][static_cast<size_t>(forced[b])] = 1.0e4f;
+    }
+    const auto predict = [&](RnntStreamState& state, int b) {
+        for (int step = 0; step < 3; ++step)
+            model.predict_rnnt(state, (b + 5 * step) % (rc.vocab_size - 1), step & 1);
+    };
+
+    std::vector<std::vector<int32_t>> plain_ref(kPlain, std::vector<int32_t>(T));
+    for (int k = 0; k < kPlain; ++k) {
+        auto state = model.make_rnnt_stream_state();
+        predict(*state, kBiased + k);
+        model.joint_argmax(*state, enc[kBiased + k].data(), J, T, plain_ref[k].data());
+    }
+
+    // Streams 0..n-1 predict, then call the joint, all at once on fresh states.
+    std::vector<std::vector<int32_t>> got(B, std::vector<int32_t>(T));
+    const auto run_round = [&](int n) {
+        std::vector<std::unique_ptr<RnntStreamState>> states;
+        for (int b = 0; b < n; ++b) states.push_back(model.make_rnnt_stream_state());
+        std::atomic<int> ready{0};
+        std::atomic<bool> go{false};
+        std::vector<std::thread> pool;
+        for (int b = 0; b < n; ++b) {
+            pool.emplace_back([&, b]() {
+                ready.fetch_add(1);
+                while (!go.load()) std::this_thread::yield();
+                predict(*states[b], b);
+                model.joint_argmax(
+                    *states[b], enc[b].data(), J, T, got[b].data(),
+                    b < kBiased ? bias[b].data() : nullptr);
+            });
+        }
+        while (ready.load() != n) std::this_thread::yield();
+        go.store(true);
+        for (auto& thread : pool) thread.join();
+    };
+    const auto biased_rows_ok = [&]() {
+        for (int b = 0; b < kBiased; ++b) {
+            for (int t = 0; t < T; ++t) {
+                if (got[b][t] != forced[b]) {
+                    std::fprintf(
+                        stderr,
+                        "[FAIL] batched joint bias row: stream %d frame %d got %d, want %d\n", b, t,
+                        got[b][t], forced[b]);
+                    return false;
+                }
+            }
+        }
+        return true;
+    };
+
+    for (int round = 0; round < 8; ++round) {
+        run_round(kBiased);
+        if (!biased_rows_ok())
+            return false;
+    }
+    const uint64_t biased_max = model.joint_batch_metrics().max_observed_batch;
+
+    run_round(B);
+    if (!biased_rows_ok())
+        return false;
+    for (int k = 0; k < kPlain; ++k) {
+        if (got[kBiased + k] != plain_ref[k]) {
+            std::fprintf(stderr, "[FAIL] unbiased stream %d changed next to biased ones\n", k);
+            return false;
+        }
+    }
+    std::fprintf(
+        stderr, "[decoder bias batch] biased-only joint max B=%llu\n",
+        (unsigned long long)biased_max);
+    if (biased_max < 2) {
+        std::fprintf(stderr, "[FAIL] biased joint calls were never batched together\n");
+        return false;
+    }
+    return true;
+}
+
 bool
 verify_fresh_encoder_slots(RnntModel& model, int right_context) {
     constexpr int B = 4;
@@ -370,6 +471,9 @@ main(int argc, char** argv) {
             return 5;
         }
     }
+    // Before verify_decoder_batch, so its batch-size metric is this check's own.
+    if (!verify_decoder_batch_bias(*rnnt))
+        return 5;
     if (!verify_decoder_batch(*rnnt))
         return 5;
 
