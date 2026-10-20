@@ -50,7 +50,18 @@ is_class_hint(const std::string& s) {
 RnntGreedyDecoder::RnntGreedyDecoder(RnntEngine* engine, const DecoderConfig& cfg)
     : engine_(engine), bias_alpha_cfg_(static_cast<float>(cfg.boosting_tree_alpha)),
       bias_depth_scaling_(static_cast<float>(cfg.boosting_depth_scaling)),
-      bias_max_boost_(cfg.boosting_max_boost) {
+      bias_max_boost_(cfg.boosting_max_boost),
+      blank_penalty_(static_cast<float>(cfg.blank_penalty)),
+      blank_after_(cfg.blank_penalty_after_frames) {
+    if (!std::isfinite(cfg.blank_penalty) || cfg.blank_penalty < 0.0 ||
+        cfg.blank_penalty_after_frames < 0)
+        throw std::invalid_argument(
+            "decoder.blank_penalty and blank_penalty_after_frames must be >= 0");
+    if (blank_penalty_ > 0.0f) {
+        const auto& rc = engine_->rnnt_config();
+        blank_bias_.assign(static_cast<size_t>(rc.vocab_size), 0.0f);
+        blank_bias_[static_cast<size_t>(rc.blank_id)] = -blank_penalty_;
+    }
     reset();
 }
 
@@ -243,7 +254,21 @@ RnntGreedyDecoder::step_impl(
     int t = 0;
     int symbols_at_frame = 0;
     while (t < T) {
-        const int remaining = T - t;
+        // The blank penalty applies from the frame blank_after_ frames past the
+        // last emitted token, and from the first frame while no token has been
+        // emitted. One joint call carries one bias, so a run that crosses that
+        // frame is split there.
+        int remaining = T - t;
+        bool penalize = false;
+        if (blank_penalty_ > 0.0f) {
+            const int64_t on =
+                (last_emit_frame_ < 0 ? 0 : last_emit_frame_ + blank_after_) - frame_offset;
+            if (on <= t)
+                penalize = true;
+            else if (on < T)
+                remaining = static_cast<int>(on) - t;
+        }
+        const float* logit_bias = penalize ? blank_bias_.data() : nullptr;
         const float* boost_bias = nullptr;
         if (bias_on_) {
             // NeMo/riva semantics (rnnt_label_looping.py): blank vs non-blank is
@@ -255,6 +280,7 @@ RnntGreedyDecoder::step_impl(
             // frame run: the match state only changes on a non-blank commit,
             // which starts a fresh round.
             const ContextBiasingTree::StepBoost sb = bias_tree_.step_boost(bias_node_);
+            // The blank penalty is not needed here: this pass excludes blank.
             bias_scratch_.assign(static_cast<size_t>(cfg.vocab_size), 0.0f);
             for (const auto& sp : sb.specials) {
                 if (sp.first != blank_id && sp.first >= 0 && sp.first < cfg.vocab_size)
@@ -268,7 +294,7 @@ RnntGreedyDecoder::step_impl(
         if (!predictor_valid_ && device_enc_out != nullptr && boost_bias == nullptr) {
             engine_->predict_and_joint_rnnt_argmax_device(
                 *stream_state_, prev_token_, active_bank_, *device_enc_out, t, d_model, remaining,
-                token_ids_.data());
+                token_ids_.data(), logit_bias);
             ++stats_.predictor_calls;
             ++stats_.joint_calls;
             stats_.joint_frames += static_cast<uint64_t>(remaining);
@@ -285,11 +311,12 @@ RnntGreedyDecoder::step_impl(
         if (!joint_complete) {
             if (device_enc_out != nullptr) {
                 engine_->joint_argmax_device(
-                    *stream_state_, *device_enc_out, t, d_model, remaining, token_ids_.data());
+                    *stream_state_, *device_enc_out, t, d_model, remaining, token_ids_.data(),
+                    logit_bias);
             } else {
                 engine_->joint_argmax(
                     *stream_state_, enc_out + static_cast<size_t>(t) * d_model, d_model, remaining,
-                    token_ids_.data());
+                    token_ids_.data(), logit_bias);
             }
             ++stats_.joint_calls;
             stats_.joint_frames += static_cast<uint64_t>(remaining);
@@ -321,7 +348,13 @@ RnntGreedyDecoder::step_impl(
             }
         }
         if (first_emit < 0) {
-            // Every remaining frame is blank under this predictor state.
+            // Every frame of this run is blank under this predictor state. If
+            // the run stopped where the blank penalty starts, decode the rest.
+            if (t + remaining < T) {
+                t += remaining;
+                symbols_at_frame = 0;
+                continue;
+            }
             break;
         }
 
