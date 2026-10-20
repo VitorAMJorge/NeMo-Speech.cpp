@@ -11,13 +11,19 @@
 //                      prev_token preserved across reset_utterance (riva EOU).
 //
 // Usage: ./test_decoders   (no model files, no GPU)
+#include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <deque>
 #include <limits>
+#include <map>
+#include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -940,6 +946,171 @@ test_rnnt_blank_penalty_after_silence() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Blank penalty under concurrency, checked against the rule itself rather than
+// against a transcript. Each stream has a script (absolute frame -> token); the
+// engine emits a scripted token once, at its frame, and blank everywhere else.
+// Encoder values carry the absolute frame, so the engine needs no call order.
+// Every joint call is recorded on the stream's own state; the oracle replays
+// them and checks the bias each one carried.
+// ---------------------------------------------------------------------------
+class ScriptedRnntEngine : public RnntEngine {
+   public:
+    struct Call {
+        int64_t first_frame;
+        int frames;
+        float blank_bias;
+    };
+    struct State : RnntStreamState {
+        std::map<int64_t, int> pending;  // frame -> token not yet emitted
+        std::vector<Call> calls;
+    };
+
+    explicit ScriptedRnntEngine(std::vector<std::map<int64_t, int>> scripts)
+        : scripts_(std::move(scripts)) {
+        cfg_.d_model = 2;
+        cfg_.vocab_size = 4;  // ids 0..2 + blank
+        cfg_.blank_id = 3;
+        cfg_.pred_hidden = 2;
+        cfg_.pred_num_layers = 1;
+        cfg_.joint_dim = 2;
+        cfg_.max_symbols_per_step = 3;
+        vocab_ = {
+            "\xE2\x96\x81"
+            "a",
+            "\xE2\x96\x81"
+            "b",
+            "\xE2\x96\x81"
+            "c"};
+    }
+
+    const RnntConfig& rnnt_config() const override { return cfg_; }
+    const std::vector<std::string>& vocab() const override { return vocab_; }
+
+    // Streams are created one per decoder, in construction order.
+    std::unique_ptr<RnntStreamState> make_rnnt_stream_state() override {
+        std::lock_guard<std::mutex> lock(mu_);
+        auto state = std::make_unique<State>();
+        state->pending = scripts_.at(states_.size() % scripts_.size());
+        states_.push_back(state.get());
+        return state;
+    }
+
+    void predict_rnnt(RnntStreamState&, int, int) override {}
+
+    // Touches only the caller's own state: safe from concurrent streams.
+    void joint_argmax(
+        RnntStreamState& opaque, const float* enc_proj, int joint_dim, int T, int32_t* token_ids,
+        const float* logit_bias = nullptr) override {
+        auto& state = static_cast<State&>(opaque);
+        const auto frame = [&](int i) {
+            return static_cast<int64_t>(enc_proj[static_cast<size_t>(i) * joint_dim]);
+        };
+        state.calls.push_back({frame(0), T, logit_bias ? logit_bias[cfg_.blank_id] : 0.0f});
+        bool committed = false;
+        for (int i = 0; i < T; ++i) {
+            const auto it = state.pending.find(frame(i));
+            token_ids[i] = it != state.pending.end() ? it->second : cfg_.blank_id;
+            // The decoder commits the first non-blank only; later ones are re-asked.
+            if (it != state.pending.end() && !committed) {
+                state.pending.erase(it);
+                committed = true;
+            }
+        }
+    }
+
+    void joint_tdt_argmax(RnntStreamState&, const float*, int, int, int32_t*, int32_t*) override {
+        throw std::runtime_error("scripted engine does not implement TDT");
+    }
+
+    State& state(size_t i) { return *states_.at(i); }
+
+   private:
+    RnntConfig cfg_;
+    std::vector<std::string> vocab_;
+    std::vector<std::map<int64_t, int>> scripts_;
+    std::mutex mu_;
+    std::vector<State*> states_;
+};
+
+// The rule, independent of the decoder: a call is penalized iff its first frame
+// is at least N frames past the last emitted token (or no token yet), and no
+// call spans the frame where that changes.
+bool
+blank_penalty_calls_follow_rule(
+    const std::vector<ScriptedRnntEngine::Call>& calls, const std::map<int64_t, int>& script,
+    int after_frames, float penalty) {
+    std::map<int64_t, int> pending = script;
+    int64_t last = -1;
+    for (const auto& c : calls) {
+        const int64_t on = last < 0 ? 0 : last + after_frames;
+        const bool penalized = c.first_frame >= on;
+        if (!near(c.blank_bias, penalized ? -penalty : 0.0f))
+            return false;
+        if (!penalized && c.first_frame + c.frames > on)
+            return false;
+        const auto it = pending.lower_bound(c.first_frame);
+        if (it != pending.end() && it->first < c.first_frame + c.frames) {
+            last = it->first;
+            pending.erase(it);
+        }
+    }
+    return pending.empty();  // every scripted token was emitted
+}
+
+void
+test_rnnt_blank_penalty_concurrent_streams() {
+    constexpr int kStreams = 8;
+    constexpr int kFrames = 64;
+    constexpr int kAfter = 4;
+    // Speech bursts and pauses of different lengths, offset per stream.
+    std::vector<std::map<int64_t, int>> scripts(kStreams);
+    for (int s = 0; s < kStreams; ++s)
+        for (int64_t f : {1, 2, 3, 9, 10, 18, 19, 20, 21, 35, 36, 50, 55, 60})
+            if (f + s < kFrames)
+                scripts[s][f + s] = static_cast<int>((f + s) % 3);
+
+    ScriptedRnntEngine eng(scripts);
+    const int J = eng.rnnt_config().joint_dim;
+    std::vector<std::unique_ptr<RnntGreedyDecoder>> decoders;
+    for (int s = 0; s < kStreams; ++s)
+        decoders.push_back(
+            std::make_unique<RnntGreedyDecoder>(&eng, penalty_config(/*after_frames=*/kAfter)));
+
+    std::atomic<int> ready{0};
+    std::atomic<bool> go{false};
+    std::vector<std::thread> pool;
+    for (int s = 0; s < kStreams; ++s) {
+        pool.emplace_back([&, s]() {
+            ready.fetch_add(1);
+            while (!go.load()) std::this_thread::yield();
+            const int chunk = 1 + s % 5;  // chunk sizes differ between streams
+            for (int64_t f0 = 0; f0 < kFrames; f0 += chunk) {
+                const int T = static_cast<int>(std::min<int64_t>(chunk, kFrames - f0));
+                std::vector<float> enc(static_cast<size_t>(T) * J, 0.0f);
+                for (int i = 0; i < T; ++i)
+                    enc[static_cast<size_t>(i) * J] = static_cast<float>(f0 + i);
+                decoders[s]->step(enc.data(), J, T, f0);
+            }
+        });
+    }
+    while (ready.load() != kStreams) std::this_thread::yield();
+    go.store(true);
+    for (auto& thread : pool) thread.join();
+
+    bool all = true;
+    bool both_states = true;
+    for (int s = 0; s < kStreams; ++s) {
+        const auto& calls = eng.state(s).calls;
+        all = all && blank_penalty_calls_follow_rule(calls, scripts[s], kAfter, kBlankPenalty);
+        bool on = false, off = false;
+        for (const auto& c : calls) (c.blank_bias != 0.0f ? on : off) = true;
+        both_states = both_states && on && off;
+    }
+    check(both_states, "blank penalty: concurrent streams exercise both penalized and plain calls");
+    check(all, "blank penalty: concurrent streams each follow the rule on every joint call");
+}
+
 }  // namespace
 
 int
@@ -961,6 +1132,7 @@ main() {
     test_rnnt_late_punctuation_returns_to_previous_final();
     test_rnnt_endpoint_punctuation_continuity();
     test_rnnt_blank_penalty_after_silence();
+    test_rnnt_blank_penalty_concurrent_streams();
     test_rnnt_state_threading_and_reset_utterance();
     test_rnnt_word_timings();
     test_rnnt_punctuation_word_timing();

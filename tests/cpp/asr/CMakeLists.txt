@@ -47,7 +47,7 @@ add_executable(test_audio_decoder test_audio_decoder.cpp)
 target_link_libraries(test_audio_decoder PRIVATE nemo_speech_common)
 
 add_executable(test_decoders test_decoders.cpp)
-target_link_libraries(test_decoders PRIVATE nemo_speech_asr)
+target_link_libraries(test_decoders PRIVATE nemo_speech_asr Threads::Threads)
 add_test(NAME decoders COMMAND test_decoders)
 
 # Do not link sentencepiece directly; it is provided by nemo_speech_asr.
