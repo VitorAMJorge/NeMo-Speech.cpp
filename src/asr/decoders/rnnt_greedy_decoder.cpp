@@ -42,6 +42,24 @@ is_class_hint(const std::string& s) {
     }
     return true;
 }
+
+// Sentence-ending marks for the end-of-stream floor, in any script the model
+// may write: '.', '?', '!', the danda forms, and the fullwidth and Arabic
+// terminators. Floored together so the model's natural terminal wins.
+bool
+is_sentence_end(const std::string& piece) {
+    if (sp_is_sentence_terminator(piece))
+        return true;
+    const std::string text = sp_piece_text(piece);
+    return text == "\xE3\x80\x82" || text == "\xEF\xBC\x81" || text == "\xEF\xBC\x9F" ||
+           text == "\xD8\x9F";
+}
+
+// Configured values are doubles but are applied as float logits.
+bool
+is_valid_logit_offset(double v) {
+    return v >= 0.0 && std::isfinite(static_cast<float>(v));
+}
 }  // namespace
 
 // ===========================================================================
@@ -53,12 +71,11 @@ RnntGreedyDecoder::RnntGreedyDecoder(RnntEngine* engine, const DecoderConfig& cf
       bias_max_boost_(cfg.boosting_max_boost),
       blank_penalty_(static_cast<float>(cfg.blank_penalty)),
       blank_after_(cfg.blank_penalty_after_frames) {
-    if (!std::isfinite(cfg.blank_penalty) || cfg.blank_penalty < 0.0 ||
-        cfg.blank_penalty_after_frames < 0)
+    if (!is_valid_logit_offset(cfg.blank_penalty) || cfg.blank_penalty_after_frames < 0)
         throw std::invalid_argument(
-            "decoder.blank_penalty and blank_penalty_after_frames must be >= 0");
-    if (!std::isfinite(cfg.stream_end_punctuation_floor) || cfg.stream_end_punctuation_floor < 0.0)
-        throw std::invalid_argument("decoder.stream_end_punctuation_floor must be >= 0");
+            "decoder.blank_penalty and blank_penalty_after_frames must be finite and >= 0");
+    if (!is_valid_logit_offset(cfg.stream_end_punctuation_floor))
+        throw std::invalid_argument("decoder.stream_end_punctuation_floor must be finite and >= 0");
     build_punct_bias(static_cast<float>(cfg.stream_end_punctuation_floor));
     if (blank_penalty_ > 0.0f) {
         const auto& rc = engine_->rnnt_config();
@@ -87,12 +104,7 @@ RnntGreedyDecoder::build_punct_bias(float floor) {
     // joint output includes it, so size the graph input from RNNT metadata.
     punct_bias_.assign(static_cast<size_t>(engine_->rnnt_config().vocab_size), 0.0f);
     for (int id = 0; id < static_cast<int>(vocab.size()); ++id) {
-        const std::string& p = vocab[id];
-        // Multilingual models also terminate with '!' and the Devanagari danda
-        // U+0964 (Hindi etc.); floor those too so the model's natural terminal
-        // wins instead of a spurious '.'/'?'.
-        if (p == "." || p == "?" || p == "!" || p == "\xE0\xA5\xA4" || p == "\xE2\x96\x81." ||
-            p == "\xE2\x96\x81?" || p == "\xE2\x96\x81!") {
+        if (is_sentence_end(vocab[id])) {
             punct_bias_[static_cast<size_t>(id)] = floor;
             has_punct_bias_ = true;
         }
@@ -340,10 +352,13 @@ RnntGreedyDecoder::step_impl(
             boost_bias = bias_scratch_.data();
         }
         bool joint_complete = false;
-        if (!predictor_valid_ && device_enc_out != nullptr && boost_bias == nullptr) {
+        // The fused predictor+joint graph has no logit-bias input: a biased run
+        // takes the separate predictor and joint calls below.
+        if (!predictor_valid_ && device_enc_out != nullptr && boost_bias == nullptr &&
+            logit_bias == nullptr) {
             engine_->predict_and_joint_rnnt_argmax_device(
                 *stream_state_, prev_token_, active_bank_, *device_enc_out, t, d_model, remaining,
-                token_ids_.data(), logit_bias);
+                token_ids_.data());
             ++stats_.predictor_calls;
             ++stats_.joint_calls;
             stats_.joint_frames += static_cast<uint64_t>(remaining);

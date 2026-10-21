@@ -929,7 +929,8 @@ test_rnnt_blank_penalty_after_silence() {
         {-1.0, 0},
         {1.0, -1},
         {std::numeric_limits<double>::quiet_NaN(), 0},
-        {std::numeric_limits<double>::infinity(), 0}};
+        {std::numeric_limits<double>::infinity(), 0},
+        {1e300, 0}};  // finite as a double, infinite as the float logit offset
     for (const auto& bad : invalid) {
         DecoderConfig cfg;
         cfg.blank_penalty = bad.first;
@@ -1001,9 +1002,48 @@ test_rnnt_stream_end_punctuation_floor() {
                 near(eng.last_logit_bias[blank], -kBlankPenalty),
             "punctuation floor: combined with the blank penalty");
     }
+    {
+        // Every script's sentence end is floored; comma and words are not.
+        // vocab sets: {"▁।", "。", ",", "؟"} and {".", "!", "▁a", "।"}.
+        const std::vector<std::vector<std::string>> vocabs = {
+            {"\xE2\x96\x81\xE0\xA5\xA4", "\xE3\x80\x82", ",", "\xD8\x9F"},
+            {".", "!",
+             "\xE2\x96\x81"
+             "a",
+             "\xE0\xA5\xA4"}};
+        const std::vector<std::vector<bool>> floored = {
+            {true, true, false, true}, {true, true, false, true}};
+        bool all = true;
+        for (size_t v = 0; v < vocabs.size(); ++v) {
+            DecoderConfig cfg;
+            cfg.stream_end_punctuation_floor = kPunctFloor;
+            MockRnntEngine eng;
+            for (int id = 0; id < 4; ++id) eng.set_piece(id, vocabs[v][id]);
+            RnntGreedyDecoder dec(&eng, cfg);
+            dec.set_finalizing(true);
+            eng.rounds = {{eng.rnnt_config().blank_id}};
+            step_frames(dec, eng, /*frames=*/1, /*frame_offset=*/0);
+            for (int id = 0; id < 4; ++id)
+                all = all && eng.last_logit_bias.size() > 4 &&
+                      near(eng.last_logit_bias[id], floored[v][id] ? kPunctFloor : 0.0f);
+        }
+        check(all, "punctuation floor: '.', '!', danda, fullwidth and Arabic ends; no comma");
+    }
+    {
+        // A vocab without sentence ends: the floor has nothing to raise.
+        DecoderConfig cfg;
+        cfg.stream_end_punctuation_floor = kPunctFloor;
+        MockRnntEngine eng;
+        eng.set_piece(3, ",");
+        RnntGreedyDecoder dec(&eng, cfg);
+        dec.set_finalizing(true);
+        eng.rounds = {{eng.rnnt_config().blank_id}};
+        step_frames(dec, eng, /*frames=*/1, /*frame_offset=*/0);
+        check(eng.last_logit_bias.empty(), "punctuation floor: no terminators, no bias");
+    }
     for (double bad :
-         {-1.0, std::numeric_limits<double>::quiet_NaN(),
-          std::numeric_limits<double>::infinity()}) {
+         {-1.0, std::numeric_limits<double>::quiet_NaN(), std::numeric_limits<double>::infinity(),
+          1e300}) {
         DecoderConfig cfg;
         cfg.stream_end_punctuation_floor = bad;
         MockRnntEngine eng;
@@ -1014,7 +1054,60 @@ test_rnnt_stream_end_punctuation_floor() {
         catch (const std::invalid_argument&) {
             threw = true;
         }
-        check(threw, "punctuation floor: negative or non-finite values are refused");
+        check(threw, "punctuation floor: negative, non-finite or float-overflowing values refused");
+    }
+}
+
+// The device path. The fused predictor+joint graph has no bias input, so a
+// biased run must take the separate predictor and joint calls instead.
+class DeviceMockRnntEngine : public MockRnntEngine {
+   public:
+    void joint_argmax_device(
+        RnntStreamState& state, const ggml_runtime::DeviceTensor&, int /*frame_offset*/,
+        int joint_dim, int T, int32_t* token_ids, const float* logit_bias) override {
+        joint_argmax(state, nullptr, joint_dim, T, token_ids, logit_bias);
+    }
+    void predict_and_joint_rnnt_argmax_device(
+        RnntStreamState& state, int prev_token, int active_bank,
+        const ggml_runtime::DeviceTensor& enc_proj, int frame_offset, int joint_dim, int T,
+        int32_t* token_ids, const float* logit_bias) override {
+        ++fused_calls;
+        predict_rnnt(state, prev_token, active_bank);
+        joint_argmax_device(state, enc_proj, frame_offset, joint_dim, T, token_ids, logit_bias);
+    }
+    int fused_calls = 0;
+};
+
+void
+test_rnnt_bias_on_device_path() {
+    // A stand-in that passes DeviceTensor::valid(); the mock never reads it.
+    static char storage = 0;
+    ggml_tensor tensor{};
+    tensor.buffer = reinterpret_cast<ggml_backend_buffer_t>(&storage);
+    tensor.data = &storage;
+    ggml_runtime::DeviceTensor enc;
+    enc.tensor = &tensor;
+    enc.buft = reinterpret_cast<ggml_backend_buffer_type_t>(&storage);
+    {
+        // Unbiased: the fused path is used.
+        DeviceMockRnntEngine eng;
+        RnntGreedyDecoder dec(&eng);
+        const int blank = eng.rnnt_config().blank_id;
+        eng.rounds = {{0}, {blank, blank}};
+        dec.step_device(enc, eng.rnnt_config().joint_dim, 3, 0);
+        check(eng.fused_calls > 0, "device path: unbiased runs use the fused graph");
+    }
+    {
+        // Penalty on every frame: no call may go through the fused graph, and
+        // every joint call carries the penalty.
+        DeviceMockRnntEngine eng;
+        RnntGreedyDecoder dec(&eng, penalty_config(/*after_frames=*/0));
+        const int blank = eng.rnnt_config().blank_id;
+        eng.rounds = {{0}, {blank, 1}, {blank}};
+        dec.step_device(enc, eng.rnnt_config().joint_dim, 3, 0);
+        bool all = !eng.call_blank_bias.empty();
+        for (float b : eng.call_blank_bias) all = all && near(b, -kBlankPenalty);
+        check(eng.fused_calls == 0 && all, "device path: biased runs bypass the fused graph");
     }
 }
 
@@ -1206,6 +1299,7 @@ main() {
     test_rnnt_blank_penalty_after_silence();
     test_rnnt_blank_penalty_concurrent_streams();
     test_rnnt_stream_end_punctuation_floor();
+    test_rnnt_bias_on_device_path();
     test_rnnt_state_threading_and_reset_utterance();
     test_rnnt_word_timings();
     test_rnnt_punctuation_word_timing();
