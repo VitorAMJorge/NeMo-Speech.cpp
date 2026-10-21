@@ -133,8 +133,9 @@ verify_decoder_batch(RnntModel& model) {
 // Each biased stream carries a DIFFERENT bias row that forces one token by a
 // margin no accumulation order can flip, so a row swapped between streams or
 // dropped shows as the wrong token. First biased streams alone, over several
-// rounds, so any batch of two or more mixes different rows; then together with
-// unbiased streams, which must match their B=1 result.
+// rounds, so any batch of two or more mixes different rows; then concurrently
+// with unbiased streams (queued separately: JointKey includes has_bias), which
+// must match their B=1 result.
 bool
 verify_decoder_batch_bias(RnntModel& model) {
     constexpr int kBiased = 4;
@@ -204,12 +205,19 @@ verify_decoder_batch_bias(RnntModel& model) {
         return true;
     };
 
+    // Metrics accumulate for the model's lifetime: count this phase's own
+    // multi-item joint batches as a difference.
+    const auto multi = [&]() {
+        const auto m = model.joint_batch_metrics();
+        return m.batches - m.singleton_batches;
+    };
+    const uint64_t multi_before = multi();
     for (int round = 0; round < 8; ++round) {
         run_round(kBiased);
         if (!biased_rows_ok())
             return false;
     }
-    const uint64_t biased_max = model.joint_batch_metrics().max_observed_batch;
+    const uint64_t biased_multi = multi() - multi_before;
 
     run_round(B);
     if (!biased_rows_ok())
@@ -221,9 +229,9 @@ verify_decoder_batch_bias(RnntModel& model) {
         }
     }
     std::fprintf(
-        stderr, "[decoder bias batch] biased-only joint max B=%llu\n",
-        (unsigned long long)biased_max);
-    if (biased_max < 2) {
+        stderr, "[decoder bias batch] biased-only joint batches of 2+: %llu\n",
+        (unsigned long long)biased_multi);
+    if (biased_multi == 0) {
         std::fprintf(stderr, "[FAIL] biased joint calls were never batched together\n");
         return false;
     }
@@ -471,10 +479,10 @@ main(int argc, char** argv) {
             return 5;
         }
     }
-    // Before verify_decoder_batch, so its batch-size metric is this check's own.
-    if (!verify_decoder_batch_bias(*rnnt))
-        return 5;
+    // After verify_decoder_batch: its max-batch check reads lifetime metrics.
     if (!verify_decoder_batch(*rnnt))
+        return 5;
+    if (!verify_decoder_batch_bias(*rnnt))
         return 5;
 
     RecognizerConfig cfg;

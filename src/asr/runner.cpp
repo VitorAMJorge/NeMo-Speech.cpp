@@ -1173,15 +1173,26 @@ CacheStreamRunner::finalize() {
         const size_t before = all_tokens_.size();
         last_step_new_tokens_.clear();
         // The end-of-stream flush: the head may apply its stream-end
-        // punctuation floor (DecoderConfig::stream_end_punctuation_floor).
-        if (head_)
-            head_->set_finalizing(true);
-        while (static_cast<int>((mel_buf_.size() - mel_offset_) / n_mels) >=
-               next_chunk_mel_frames()) {
-            process_one_chunk();
+        // punctuation floor (DecoderConfig::stream_end_punctuation_floor). The
+        // guard clears the hint even if a chunk throws.
+        struct FinalizingHint {
+            Decoder* head;
+            explicit FinalizingHint(Decoder* h) : head(h) {
+                if (head)
+                    head->set_finalizing(true);
+            }
+            ~FinalizingHint() {
+                if (head)
+                    head->set_finalizing(false);
+            }
+        };
+        {
+            const FinalizingHint hint(head_.get());
+            while (static_cast<int>((mel_buf_.size() - mel_offset_) / n_mels) >=
+                   next_chunk_mel_frames()) {
+                process_one_chunk();
+            }
         }
-        if (head_)
-            head_->set_finalizing(false);
         for (size_t i = before; i < all_tokens_.size(); i++) {
             update.new_token_ids.push_back(all_tokens_[i]);
         }
