@@ -946,6 +946,78 @@ test_rnnt_blank_penalty_after_silence() {
     }
 }
 
+// Arbitrary; exact in binary and unlike the blank penalty and frame counts.
+constexpr float kPunctFloor = 3.25f;
+
+void
+test_rnnt_stream_end_punctuation_floor() {
+    // Mock vocab: 0 "▁a", 1 "▁b", 2 "▁c" (set to "," below), 3 "▁?", 4 blank.
+    const int terminator = 3;
+    {
+        // Off by default: the end-of-stream flush keeps native logits.
+        MockRnntEngine eng;
+        RnntGreedyDecoder dec(&eng);
+        const int blank = eng.rnnt_config().blank_id;
+        dec.set_finalizing(true);
+        eng.rounds = {{blank}};
+        step_frames(dec, eng, /*frames=*/1, /*frame_offset=*/0);
+        check(eng.last_logit_bias.empty(), "punctuation floor: off by default");
+    }
+    {
+        DecoderConfig cfg;
+        cfg.stream_end_punctuation_floor = kPunctFloor;
+        MockRnntEngine eng;
+        eng.set_piece(2, ",");
+        RnntGreedyDecoder dec(&eng, cfg);
+        const int blank = eng.rnnt_config().blank_id;
+        eng.rounds = {{blank}};
+        step_frames(dec, eng, /*frames=*/1, /*frame_offset=*/0);
+        check(eng.last_logit_bias.empty(), "punctuation floor: not applied mid-stream");
+        dec.set_finalizing(true);
+        eng.rounds = {{blank}};
+        step_frames(dec, eng, /*frames=*/1, /*frame_offset=*/1);
+        const auto& b = eng.last_logit_bias;
+        check(
+            b.size() == static_cast<size_t>(blank) + 1 && near(b[terminator], kPunctFloor) &&
+                near(b[0], 0.0f) && near(b[2], 0.0f) && near(b[blank], 0.0f),
+            "punctuation floor: terminators only on the end-of-stream flush, comma excluded");
+        dec.reset();
+        eng.rounds = {{blank}};
+        step_frames(dec, eng, /*frames=*/1, /*frame_offset=*/0);
+        check(eng.last_logit_bias.empty(), "punctuation floor: reset() clears the flush hint");
+    }
+    {
+        // With the blank penalty on the same frame, both apply.
+        DecoderConfig cfg = penalty_config(/*after_frames=*/0);
+        cfg.stream_end_punctuation_floor = kPunctFloor;
+        MockRnntEngine eng;
+        RnntGreedyDecoder dec(&eng, cfg);
+        const int blank = eng.rnnt_config().blank_id;
+        dec.set_finalizing(true);
+        eng.rounds = {{blank}};
+        step_frames(dec, eng, /*frames=*/1, /*frame_offset=*/0);
+        check(
+            near(eng.last_logit_bias[terminator], kPunctFloor) &&
+                near(eng.last_logit_bias[blank], -kBlankPenalty),
+            "punctuation floor: combined with the blank penalty");
+    }
+    for (double bad :
+         {-1.0, std::numeric_limits<double>::quiet_NaN(),
+          std::numeric_limits<double>::infinity()}) {
+        DecoderConfig cfg;
+        cfg.stream_end_punctuation_floor = bad;
+        MockRnntEngine eng;
+        bool threw = false;
+        try {
+            RnntGreedyDecoder dec(&eng, cfg);
+        }
+        catch (const std::invalid_argument&) {
+            threw = true;
+        }
+        check(threw, "punctuation floor: negative or non-finite values are refused");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Blank penalty under concurrency, checked against the rule itself rather than
 // against a transcript. Each stream has a script (absolute frame -> token); the
@@ -1133,6 +1205,7 @@ main() {
     test_rnnt_endpoint_punctuation_continuity();
     test_rnnt_blank_penalty_after_silence();
     test_rnnt_blank_penalty_concurrent_streams();
+    test_rnnt_stream_end_punctuation_floor();
     test_rnnt_state_threading_and_reset_utterance();
     test_rnnt_word_timings();
     test_rnnt_punctuation_word_timing();

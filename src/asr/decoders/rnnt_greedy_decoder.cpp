@@ -57,12 +57,48 @@ RnntGreedyDecoder::RnntGreedyDecoder(RnntEngine* engine, const DecoderConfig& cf
         cfg.blank_penalty_after_frames < 0)
         throw std::invalid_argument(
             "decoder.blank_penalty and blank_penalty_after_frames must be >= 0");
+    if (!std::isfinite(cfg.stream_end_punctuation_floor) || cfg.stream_end_punctuation_floor < 0.0)
+        throw std::invalid_argument("decoder.stream_end_punctuation_floor must be >= 0");
+    build_punct_bias(static_cast<float>(cfg.stream_end_punctuation_floor));
     if (blank_penalty_ > 0.0f) {
         const auto& rc = engine_->rnnt_config();
         blank_bias_.assign(static_cast<size_t>(rc.vocab_size), 0.0f);
         blank_bias_[static_cast<size_t>(rc.blank_id)] = -blank_penalty_;
+        if (has_punct_bias_) {
+            blank_punct_bias_ = punct_bias_;
+            blank_punct_bias_[static_cast<size_t>(rc.blank_id)] -= blank_penalty_;
+        }
     }
     reset();
+}
+
+// Identify the sentence-terminator tokens and give them the end-of-stream
+// floor. riva's PunctBiasHelper uses bump 1.5 for '.'/'?' with an EOS floor of
+// PUNCT_BIAS_EOS_STALL_FLOOR (5) * bump = 7.5. Comma is mid-sentence (the model
+// emits it on its own) and is not floored.
+void
+RnntGreedyDecoder::build_punct_bias(float floor) {
+    punct_bias_.clear();
+    has_punct_bias_ = false;
+    if (floor <= 0.0f)
+        return;
+    const auto& vocab = engine_->vocab();
+    // The vocabulary vector may omit the terminal blank entry even though the
+    // joint output includes it, so size the graph input from RNNT metadata.
+    punct_bias_.assign(static_cast<size_t>(engine_->rnnt_config().vocab_size), 0.0f);
+    for (int id = 0; id < static_cast<int>(vocab.size()); ++id) {
+        const std::string& p = vocab[id];
+        // Multilingual models also terminate with '!' and the Devanagari danda
+        // U+0964 (Hindi etc.); floor those too so the model's natural terminal
+        // wins instead of a spurious '.'/'?'.
+        if (p == "." || p == "?" || p == "!" || p == "\xE0\xA5\xA4" || p == "\xE2\x96\x81." ||
+            p == "\xE2\x96\x81?" || p == "\xE2\x96\x81!") {
+            punct_bias_[static_cast<size_t>(id)] = floor;
+            has_punct_bias_ = true;
+        }
+    }
+    if (!has_punct_bias_)
+        punct_bias_.clear();
 }
 
 void
@@ -134,6 +170,7 @@ RnntGreedyDecoder::reset() {
     words_.clear();
     cur_open_ = false;
     cur_ = WordTiming{};
+    finalizing_ = false;
     utterance_has_content_ = false;
     last_presented_punctuation_ = false;
     pending_word_boundary_ = false;
@@ -268,7 +305,15 @@ RnntGreedyDecoder::step_impl(
             else if (on < T)
                 remaining = static_cast<int>(on) - t;
         }
-        const float* logit_bias = penalize ? blank_bias_.data() : nullptr;
+        // Whether closing a stream ends a sentence depends on the application.
+        // With stream_end_punctuation_floor set, the end-of-stream flush raises
+        // the sentence terminators so a marginal terminal mark is committed.
+        const bool eos_floor = finalizing_ && has_punct_bias_;
+        const float* logit_bias = nullptr;
+        if (penalize)
+            logit_bias = eos_floor ? blank_punct_bias_.data() : blank_bias_.data();
+        else if (eos_floor)
+            logit_bias = punct_bias_.data();
         const float* boost_bias = nullptr;
         if (bias_on_) {
             // NeMo/riva semantics (rnnt_label_looping.py): blank vs non-blank is
@@ -280,8 +325,12 @@ RnntGreedyDecoder::step_impl(
             // frame run: the match state only changes on a non-blank commit,
             // which starts a fresh round.
             const ContextBiasingTree::StepBoost sb = bias_tree_.step_boost(bias_node_);
-            // The blank penalty is not needed here: this pass excludes blank.
-            bias_scratch_.assign(static_cast<size_t>(cfg.vocab_size), 0.0f);
+            // The blank penalty is not needed here: this pass excludes blank. The
+            // punctuation floor is, so a floored terminator keeps its rank.
+            if (eos_floor)
+                bias_scratch_.assign(punct_bias_.begin(), punct_bias_.end());
+            else
+                bias_scratch_.assign(static_cast<size_t>(cfg.vocab_size), 0.0f);
             for (const auto& sp : sb.specials) {
                 if (sp.first != blank_id && sp.first >= 0 && sp.first < cfg.vocab_size)
                     bias_scratch_[static_cast<size_t>(sp.first)] +=
@@ -306,8 +355,9 @@ RnntGreedyDecoder::step_impl(
             predictor_valid_ = true;
         }
 
-        // Silence and stream closure do not imply sentence completion. Keep
-        // native punctuation logits unchanged, including on the EOS tail.
+        // The optional logit bias (blank penalty, end-of-stream punctuation
+        // floor) is added in the joint graph before its device-side argmax,
+        // keeping the vectorized blank-run path and the logits on the device.
         if (!joint_complete) {
             if (device_enc_out != nullptr) {
                 engine_->joint_argmax_device(

@@ -1172,10 +1172,16 @@ CacheStreamRunner::finalize() {
         mel_buf_.resize(mel_buf_.size() + flush_pad_frames * static_cast<size_t>(n_mels), 0.0f);
         const size_t before = all_tokens_.size();
         last_step_new_tokens_.clear();
+        // The end-of-stream flush: the head may apply its stream-end
+        // punctuation floor (DecoderConfig::stream_end_punctuation_floor).
+        if (head_)
+            head_->set_finalizing(true);
         while (static_cast<int>((mel_buf_.size() - mel_offset_) / n_mels) >=
                next_chunk_mel_frames()) {
             process_one_chunk();
         }
+        if (head_)
+            head_->set_finalizing(false);
         for (size_t i = before; i < all_tokens_.size(); i++) {
             update.new_token_ids.push_back(all_tokens_[i]);
         }
