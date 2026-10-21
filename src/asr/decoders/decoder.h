@@ -58,6 +58,12 @@ struct DecoderConfig {
     // decoded as without it. 0 disables; after_frames 0 applies it on every frame.
     double blank_penalty = 0.0;
     int blank_penalty_after_frames = 0;
+    // RNNT greedy only: added to the sentence-terminator logits ('.', '?', '!',
+    // U+0964) on the end-of-stream flush, so a terminal mark that narrowly loses
+    // to blank there is committed. Whether closing a stream ends a sentence
+    // depends on the application; 0 (the default) leaves the logits native.
+    // 7.5 reproduces the floor riva's PunctBiasHelper applies (5 x bump 1.5).
+    double stream_end_punctuation_floor = 0.0;
     void Register(common::ParameterParser& p) {
         p.Register(
             "kind",
@@ -110,6 +116,9 @@ struct DecoderConfig {
         p.Register(
             "blank_penalty_after_frames", &blank_penalty_after_frames,
             "RNNT greedy: encoder frames without an emitted token before blank_penalty applies");
+        p.Register(
+            "stream_end_punctuation_floor", &stream_end_punctuation_floor,
+            "RNNT greedy: sentence-terminator logit floor on the end-of-stream flush (0 disables)");
     }
 };
 
@@ -233,6 +242,11 @@ class Decoder {
     // part of their normal decode ignore it; FlashlightDecoder uses it to skip
     // an extra per-frame argmax it would otherwise run only to feed this signal.
     virtual void set_track_speech_frame(bool /*on*/) {}
+
+    // Hint: the following step() calls decode the end-of-stream flush. RNNT
+    // greedy applies DecoderConfig::stream_end_punctuation_floor there; other
+    // heads ignore it. Cleared by reset().
+    virtual void set_finalizing(bool /*on*/) {}
 
     // Returns and clears sentence punctuation emitted after an endpoint but
     // before the next word; it belongs to the already-published utterance.

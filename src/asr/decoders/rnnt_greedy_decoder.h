@@ -168,6 +168,7 @@ class RnntGreedyDecoder : public Decoder {
     const std::vector<std::string>& vocab() const override { return engine_->vocab(); }
 
     void set_compute_timestamps(bool on) override { compute_ts_ = on; }
+    void set_finalizing(bool on) override { finalizing_ = on; }
     const std::vector<WordTiming>& word_timings() const override { return words_; }
     void finalize() override;  // flush the trailing in-progress word
     int64_t last_emit_frame() const override { return last_emit_frame_; }
@@ -185,6 +186,7 @@ class RnntGreedyDecoder : public Decoder {
         int64_t frame_offset);
     void flush_word();
     bool present_token(int token, int64_t frame);
+    void build_punct_bias(float floor);
 
     RnntEngine* engine_;
     std::unique_ptr<RnntStreamState> stream_state_;
@@ -235,10 +237,19 @@ class RnntGreedyDecoder : public Decoder {
     std::vector<int32_t> boost_token_ids_;  // blank-excluded re-rank pass output
 
     // DecoderConfig::blank_penalty: -penalty at blank, on frames at least
-    // blank_after_ frames past the last emitted token. Built once.
+    // blank_after_ frames past the last emitted token. Built once; the second
+    // vector adds it to the end-of-stream punctuation floor.
     float blank_penalty_ = 0.0f;
     int blank_after_ = 0;
     std::vector<float> blank_bias_;
+    std::vector<float> blank_punct_bias_;
+
+    // DecoderConfig::stream_end_punctuation_floor on the sentence terminators,
+    // applied while finalizing_ (the end-of-stream flush). Empty when the floor
+    // is 0 or the vocab has no terminators.
+    std::vector<float> punct_bias_;
+    bool has_punct_bias_ = false;
+    bool finalizing_ = false;
 };
 
 // Token-and-Duration Transducer greedy decoder. Predictor state commits only
