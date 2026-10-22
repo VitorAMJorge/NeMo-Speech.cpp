@@ -187,6 +187,10 @@ class RnntGreedyDecoder : public Decoder {
     void flush_word();
     bool present_token(int token, int64_t frame);
     void build_punct_bias(float floor);
+    const float* select_logit_bias(int t, int T, int64_t frame_offset, int* remaining) const;
+    // Whether closing a stream ends a sentence depends on the application; with
+    // stream_end_punctuation_floor set, the end-of-stream flush raises them.
+    bool stream_end_floor() const { return finalizing_ && !punct_bias_.empty(); }
 
     RnntEngine* engine_;
     std::unique_ptr<RnntStreamState> stream_state_;
@@ -237,18 +241,17 @@ class RnntGreedyDecoder : public Decoder {
     std::vector<int32_t> boost_token_ids_;  // blank-excluded re-rank pass output
 
     // DecoderConfig::blank_penalty: -penalty at blank, on frames at least
-    // blank_after_ frames past the last emitted token. Built once; the second
-    // vector adds it to the end-of-stream punctuation floor.
+    // blank_penalty_after_frames_ frames past the last emitted token. Built
+    // once; the second vector adds it to the end-of-stream punctuation floor.
     float blank_penalty_ = 0.0f;
-    int blank_after_ = 0;
+    int blank_penalty_after_frames_ = 0;
     std::vector<float> blank_bias_;
     std::vector<float> blank_punct_bias_;
 
-    // DecoderConfig::stream_end_punctuation_floor on the sentence terminators,
-    // applied while finalizing_ (the end-of-stream flush). Empty when the floor
-    // is 0 or the vocab has no terminators.
+    // DecoderConfig::stream_end_punctuation_floor on the sentence ends, applied
+    // while finalizing_ (the end-of-stream flush). Empty when the floor is 0 or
+    // the vocab has no sentence ends.
     std::vector<float> punct_bias_;
-    bool has_punct_bias_ = false;
     bool finalizing_ = false;
 };
 

@@ -1952,6 +1952,11 @@ RnntModel::predict_and_joint_rnnt_argmax_device(
     if (active_bank != 0 && active_bank != 1)
         throw std::invalid_argument(
             "predict_and_joint_rnnt_argmax_device: active bank must be 0 or 1");
+    // The fused predictor+joint graph has no logit-bias input; a biased caller
+    // must use predict_rnnt + joint_argmax_device instead.
+    if (logit_bias != nullptr)
+        throw std::invalid_argument(
+            "predict_and_joint_rnnt_argmax_device: the fused graph takes no logit bias");
     auto result = decoder_batchers_->predict_joint_rnnt_device(
         state->slot, static_cast<int32_t>(prev_token), active_bank, enc_proj, frame_offset, T,
         logit_bias, rnnt_cfg_.vocab_size, state->needs_reset);

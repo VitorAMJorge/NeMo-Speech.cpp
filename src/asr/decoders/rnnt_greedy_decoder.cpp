@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -43,22 +44,13 @@ is_class_hint(const std::string& s) {
     return true;
 }
 
-// Sentence-ending marks for the end-of-stream floor, in any script the model
-// may write: '.', '?', '!', the danda forms, and the fullwidth and Arabic
-// terminators. Floored together so the model's natural terminal wins.
-bool
-is_sentence_end(const std::string& piece) {
-    if (sp_is_sentence_terminator(piece))
-        return true;
-    const std::string text = sp_piece_text(piece);
-    return text == "\xE3\x80\x82" || text == "\xEF\xBC\x81" || text == "\xEF\xBC\x9F" ||
-           text == "\xD8\x9F";
-}
-
-// Configured values are doubles but are applied as float logits.
-bool
-is_valid_logit_offset(double v) {
-    return v >= 0.0 && std::isfinite(static_cast<float>(v));
+// A configured double applied as a float logit offset: range-checked before the
+// narrowing conversion, which is undefined for out-of-range values. Rejects NaN.
+float
+logit_offset(double v, const char* key) {
+    if (!(v >= 0.0 && v <= std::numeric_limits<float>::max()))
+        throw std::invalid_argument(std::string("decoder.") + key + " must be finite and >= 0");
+    return static_cast<float>(v);
 }
 }  // namespace
 
@@ -69,19 +61,17 @@ RnntGreedyDecoder::RnntGreedyDecoder(RnntEngine* engine, const DecoderConfig& cf
     : engine_(engine), bias_alpha_cfg_(static_cast<float>(cfg.boosting_tree_alpha)),
       bias_depth_scaling_(static_cast<float>(cfg.boosting_depth_scaling)),
       bias_max_boost_(cfg.boosting_max_boost),
-      blank_penalty_(static_cast<float>(cfg.blank_penalty)),
-      blank_after_(cfg.blank_penalty_after_frames) {
-    if (!is_valid_logit_offset(cfg.blank_penalty) || cfg.blank_penalty_after_frames < 0)
-        throw std::invalid_argument(
-            "decoder.blank_penalty and blank_penalty_after_frames must be finite and >= 0");
-    if (!is_valid_logit_offset(cfg.stream_end_punctuation_floor))
-        throw std::invalid_argument("decoder.stream_end_punctuation_floor must be finite and >= 0");
-    build_punct_bias(static_cast<float>(cfg.stream_end_punctuation_floor));
+      blank_penalty_(logit_offset(cfg.blank_penalty, "blank_penalty")),
+      blank_penalty_after_frames_(cfg.blank_penalty_after_frames) {
+    if (blank_penalty_after_frames_ < 0)
+        throw std::invalid_argument("decoder.blank_penalty_after_frames must be >= 0");
+    build_punct_bias(
+        logit_offset(cfg.stream_end_punctuation_floor, "stream_end_punctuation_floor"));
     if (blank_penalty_ > 0.0f) {
         const auto& rc = engine_->rnnt_config();
         blank_bias_.assign(static_cast<size_t>(rc.vocab_size), 0.0f);
         blank_bias_[static_cast<size_t>(rc.blank_id)] = -blank_penalty_;
-        if (has_punct_bias_) {
+        if (!punct_bias_.empty()) {
             blank_punct_bias_ = punct_bias_;
             blank_punct_bias_[static_cast<size_t>(rc.blank_id)] -= blank_penalty_;
         }
@@ -96,21 +86,43 @@ RnntGreedyDecoder::RnntGreedyDecoder(RnntEngine* engine, const DecoderConfig& cf
 void
 RnntGreedyDecoder::build_punct_bias(float floor) {
     punct_bias_.clear();
-    has_punct_bias_ = false;
     if (floor <= 0.0f)
         return;
     const auto& vocab = engine_->vocab();
     // The vocabulary vector may omit the terminal blank entry even though the
     // joint output includes it, so size the graph input from RNNT metadata.
-    punct_bias_.assign(static_cast<size_t>(engine_->rnnt_config().vocab_size), 0.0f);
+    std::vector<float> bias(static_cast<size_t>(engine_->rnnt_config().vocab_size), 0.0f);
+    bool any = false;
     for (int id = 0; id < static_cast<int>(vocab.size()); ++id) {
-        if (is_sentence_end(vocab[id])) {
-            punct_bias_[static_cast<size_t>(id)] = floor;
-            has_punct_bias_ = true;
+        if (sp_is_sentence_end(vocab[id])) {
+            bias[static_cast<size_t>(id)] = floor;
+            any = true;
         }
     }
-    if (!has_punct_bias_)
-        punct_bias_.clear();
+    if (any)
+        punct_bias_ = std::move(bias);
+}
+
+// The joint logit bias for the run starting at chunk frame t: the blank penalty
+// from blank_penalty_after_frames_ frames past the last emitted token (from the
+// first frame while no token has been emitted), and the end-of-stream
+// punctuation floor. One joint call carries one bias, so a run that crosses the
+// frame where the penalty starts is cut there by shortening *remaining.
+const float*
+RnntGreedyDecoder::select_logit_bias(int t, int T, int64_t frame_offset, int* remaining) const {
+    bool penalize = false;
+    if (blank_penalty_ > 0.0f) {
+        const int64_t on =
+            (last_emit_frame_ < 0 ? 0 : last_emit_frame_ + blank_penalty_after_frames_) -
+            frame_offset;
+        if (on <= t)
+            penalize = true;
+        else if (on < T)
+            *remaining = static_cast<int>(on) - t;
+    }
+    if (penalize)
+        return stream_end_floor() ? blank_punct_bias_.data() : blank_bias_.data();
+    return stream_end_floor() ? punct_bias_.data() : nullptr;
 }
 
 void
@@ -303,29 +315,8 @@ RnntGreedyDecoder::step_impl(
     int t = 0;
     int symbols_at_frame = 0;
     while (t < T) {
-        // The blank penalty applies from the frame blank_after_ frames past the
-        // last emitted token, and from the first frame while no token has been
-        // emitted. One joint call carries one bias, so a run that crosses that
-        // frame is split there.
         int remaining = T - t;
-        bool penalize = false;
-        if (blank_penalty_ > 0.0f) {
-            const int64_t on =
-                (last_emit_frame_ < 0 ? 0 : last_emit_frame_ + blank_after_) - frame_offset;
-            if (on <= t)
-                penalize = true;
-            else if (on < T)
-                remaining = static_cast<int>(on) - t;
-        }
-        // Whether closing a stream ends a sentence depends on the application.
-        // With stream_end_punctuation_floor set, the end-of-stream flush raises
-        // the sentence terminators so a marginal terminal mark is committed.
-        const bool eos_floor = finalizing_ && has_punct_bias_;
-        const float* logit_bias = nullptr;
-        if (penalize)
-            logit_bias = eos_floor ? blank_punct_bias_.data() : blank_bias_.data();
-        else if (eos_floor)
-            logit_bias = punct_bias_.data();
+        const float* logit_bias = select_logit_bias(t, T, frame_offset, &remaining);
         const float* boost_bias = nullptr;
         if (bias_on_) {
             // NeMo/riva semantics (rnnt_label_looping.py): blank vs non-blank is
@@ -339,7 +330,7 @@ RnntGreedyDecoder::step_impl(
             const ContextBiasingTree::StepBoost sb = bias_tree_.step_boost(bias_node_);
             // The blank penalty is not needed here: this pass excludes blank. The
             // punctuation floor is, so a floored terminator keeps its rank.
-            if (eos_floor)
+            if (stream_end_floor())
                 bias_scratch_.assign(punct_bias_.begin(), punct_bias_.end());
             else
                 bias_scratch_.assign(static_cast<size_t>(cfg.vocab_size), 0.0f);

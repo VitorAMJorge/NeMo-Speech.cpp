@@ -58,11 +58,13 @@ struct DecoderConfig {
     // decoded as without it. 0 disables; after_frames 0 applies it on every frame.
     double blank_penalty = 0.0;
     int blank_penalty_after_frames = 0;
-    // RNNT greedy only: added to the sentence-terminator logits ('.', '?', '!',
-    // U+0964) on the end-of-stream flush, so a terminal mark that narrowly loses
-    // to blank there is committed. Whether closing a stream ends a sentence
-    // depends on the application; 0 (the default) leaves the logits native.
-    // 7.5 reproduces the floor riva's PunctBiasHelper applies (5 x bump 1.5).
+    // RNNT greedy, cache-aware streaming only: added to the sentence-end logits
+    // (sp_is_sentence_end: '.', '?', '!', the dandas, the fullwidth and Arabic
+    // terminators; not comma) on the end-of-stream flush of finalize(), so a
+    // terminal mark that narrowly loses to blank there is committed. Whether
+    // closing a stream ends a sentence depends on the application; 0 (the
+    // default) leaves the logits native. 7.5 reproduces the floor riva's
+    // PunctBiasHelper applies (5 x bump 1.5).
     double stream_end_punctuation_floor = 0.0;
     void Register(common::ParameterParser& p) {
         p.Register(
@@ -158,6 +160,17 @@ sp_is_sentence_terminator(const std::string& p) {
     const std::string text = sp_piece_text(p);
     return text == "." || text == "?" || text == "!" || text == "\xE0\xA5\xA4" ||
            text == "\xE0\xA5\xA5";
+}
+
+// A sentence end in any script the model may write: sp_is_sentence_terminator
+// plus the fullwidth and Arabic terminators sp_is_punctuation also knows.
+inline bool
+sp_is_sentence_end(const std::string& p) {
+    if (sp_is_sentence_terminator(p))
+        return true;
+    const std::string text = sp_piece_text(p);
+    return text == "\xE3\x80\x82" || text == "\xEF\xBC\x81" || text == "\xEF\xBC\x9F" ||
+           text == "\xD8\x9F";
 }
 
 inline bool
