@@ -50,10 +50,10 @@ column lists the short flag where one exists - the dotted form
 | `asr.decoder.max_boost` | `--max-boost` | `10.0` | CTC: max per-word boost magnitude |
 | `asr.decoder.boosting_tree_alpha` | `--boosting-tree-alpha` | `1.0` | RNNT word-boosting weight (0 disables) |
 | `asr.decoder.boosting_max_boost` | `--boosting-max-boost` | `5.0` | RNNT boost clamp (greedy-safe) |
+| `asr.decoder.boosting_depth_scaling` | `--boosting-depth-scaling` | `2.0` | RNNT per-token depth scaling |
 | `asr.decoder.blank_penalty` | - | `0` | RNNT greedy: subtract from the blank logit after a silent run; `0` disables |
 | `asr.decoder.blank_penalty_after_frames` | - | `0` | encoder frames without an emitted token before `blank_penalty` applies (before the first token it applies from the first frame); any token restarts the count; `0` = every frame |
-| `asr.decoder.stream_end_punctuation_floor` | - | `0` | RNNT greedy: added to `.` `?` `!` `।` on the end-of-stream flush so a marginal terminal mark is committed; `0` disables; `7.5` = riva's end-of-stream floor |
-| `asr.decoder.boosting_depth_scaling` | `--boosting-depth-scaling` | `2.0` | RNNT per-token depth scaling |
+| `asr.decoder.stream_end_punctuation_floor` | - | `0` | RNNT greedy, cache-aware streaming: added to the sentence ends (`.` `?` `!`, dandas, fullwidth `。` `！` `？`, Arabic `؟`; not comma) on the end-of-stream flush of `finalize()`, so a marginal terminal mark is committed; `0` disables; `7.5` = riva's end-of-stream floor |
 | `asr.vad.model_path` | `--vad-model` | - | Silero VAD GGUF (empty = no VAD) |
 | `asr.vad.masker.mask_enable` | `--vad-masking` | `false` | mask silence mel frames |
 | `asr.vad.masker.onset` | `--vad-onset` | `0.5` | prob > onset → enter speech |

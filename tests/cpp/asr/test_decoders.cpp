@@ -1004,15 +1004,17 @@ test_rnnt_stream_end_punctuation_floor() {
     }
     {
         // Every script's sentence end is floored; comma and words are not.
-        // vocab sets: {"▁।", "。", ",", "؟"} and {".", "!", "▁a", "।"}.
+        // vocab sets: {"▁।", "。", ",", "؟"}, {".", "!", "▁a", "।"} and
+        // {"！", "？", "、", "॥"} (the ideographic comma is not a sentence end).
         const std::vector<std::vector<std::string>> vocabs = {
             {"\xE2\x96\x81\xE0\xA5\xA4", "\xE3\x80\x82", ",", "\xD8\x9F"},
             {".", "!",
              "\xE2\x96\x81"
              "a",
-             "\xE0\xA5\xA4"}};
+             "\xE0\xA5\xA4"},
+            {"\xEF\xBC\x81", "\xEF\xBC\x9F", "\xE3\x80\x81", "\xE0\xA5\xA5"}};
         const std::vector<std::vector<bool>> floored = {
-            {true, true, false, true}, {true, true, false, true}};
+            {true, true, false, true}, {true, true, false, true}, {true, true, false, true}};
         bool all = true;
         for (size_t v = 0; v < vocabs.size(); ++v) {
             DecoderConfig cfg;
